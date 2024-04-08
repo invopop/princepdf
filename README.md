@@ -4,7 +4,7 @@ Go library and HTTP service wrapper around Prince XML that makes it easy to gene
 
 ## Usage
 
-You'll need to have [prince installed](https://www.princexml.com/doc/installing/) on your development machine to and available to be able to develop and test. The included `Dockerfile` may be helpful for running the service.
+You'll need to have [prince installed](https://www.princexml.com/doc/installing/) on your machine and available in your `$PATH` to be able to use this library. The included `Dockerfile` may be helpful for running the service inside the container using the official binary without having to install anything locally.
 
 ### Go Package
 
