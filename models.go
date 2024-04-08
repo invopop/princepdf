@@ -55,6 +55,15 @@ func (j *Job) request() *jobRequest {
 		}
 	}
 
+	if req.PDF != nil {
+		for x, a := range req.PDF.Attach {
+			if i, ok := idxMap[a.Filename]; ok {
+				a.URL = fmt.Sprintf(strJobResource, i)
+			}
+			req.PDF.Attach[x] = a
+		}
+	}
+
 	return req
 }
 
