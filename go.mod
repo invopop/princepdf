@@ -3,9 +3,7 @@ module github.com/invopop/princepdf
 go 1.22.1
 
 require (
-	github.com/joho/godotenv v1.5.1
 	github.com/labstack/echo/v4 v4.11.4
-	github.com/magefile/mage v1.15.0
 	github.com/spf13/cobra v1.8.0
 	github.com/stretchr/testify v1.9.0
 )
