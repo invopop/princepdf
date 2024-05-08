@@ -39,7 +39,6 @@ func TestStartup(t *testing.T) {
 		out, err := pc.Run(j)
 		require.NoError(t, err)
 		require.NoError(t, os.WriteFile("output2.pdf", out, 0644))
-		assert.True(t, false)
 	})
 
 }

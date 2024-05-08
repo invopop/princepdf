@@ -11,16 +11,16 @@ import (
 )
 
 const (
-	chunkJob       = "job"
-	chunkData      = "dat"
-	chunkEnd       = "end"
-	chunkErr       = "err"
-	chunkLog       = "log"
-	chunkPDF       = "pdf"
-	strJobResource = "job-resource:%d"
-	strFilesFmt    = "files:%s"
-	cmdPrince      = "prince"
-	workerCount    = 1
+	chunkJob           = "job"
+	chunkData          = "dat"
+	chunkEnd           = "end"
+	chunkErr           = "err"
+	chunkLog           = "log"
+	chunkPDF           = "pdf"
+	strJobResource     = "job-resource:%d"
+	strFilesFmt        = "files:%s"
+	cmdPrince          = "prince"
+	workerCountDefault = 1
 )
 
 var (
@@ -30,16 +30,34 @@ var (
 // Client provides a client interface to be able to stream commands to the prince
 // controller.
 type Client struct {
-	in      chan *Job
-	workers []*worker
+	in          chan *Job
+	workerCount int
+	workers     []*worker
+}
+
+// Option defines a functional option to configure the Client
+type Option func(*Client)
+
+// WithWorkerCounter sets the number of prince processes to launch
+// thus increasing the number of concurrent requests that can be handled.
+// The default is 1.
+func WithWorkerCount(i int) Option {
+	return func(c *Client) {
+		c.workerCount = i
+	}
 }
 
 // New instantiates a new PrincePDF client
-func New() *Client {
-	return &Client{
-		in:      make(chan *Job),
-		workers: make([]*worker, workerCount),
+func New(opts ...Option) *Client {
+	c := &Client{
+		in:          make(chan *Job),
+		workerCount: workerCountDefault,
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	c.workers = make([]*worker, c.workerCount)
+	return c
 }
 
 // Start begins the workers and prepares to run jobs
@@ -55,6 +73,7 @@ func (c *Client) Start() error {
 	return nil
 }
 
+// Stop ends the workers and closes the client.
 func (c *Client) Stop() error {
 	close(c.in)
 	for _, w := range c.workers {
@@ -64,6 +83,7 @@ func (c *Client) Stop() error {
 
 }
 
+// Run sends a job to the prince controller and returns the output.
 func (c *Client) Run(job *Job) ([]byte, error) {
 	job.reply = make(chan *output)
 	defer close(job.reply)
@@ -235,9 +255,6 @@ func (w *worker) read() *output {
 
 	return o
 }
-
-// Option defines a functional option to configure the Job
-type Option func(*Job)
 
 // output wraps around output provided from a job
 type output struct {
