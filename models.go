@@ -132,9 +132,10 @@ type Encrypt struct {
 
 // Attachment indicates and embedded file inside the PDF
 type Attachment struct {
-	URL         string `json:"url,omitempty"`
-	Filename    string `json:"filename,omitempty"`
-	Description string `json:"description,omitempty"`
+	URL          string `json:"url,omitempty"`
+	Filename     string `json:"filename,omitempty"`
+	Description  string `json:"description,omitempty"`
+	Relationship string `json:"relationship,omitempty"`
 }
 
 // Metadata for additional data to include in the PDF
