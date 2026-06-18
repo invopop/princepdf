@@ -1,5 +1,5 @@
 ## Compile the Go binary
-FROM golang:1.22.1-alpine AS build-go
+FROM golang:1.26.2-alpine AS build-go
 
 RUN apk add --update --no-cache \
     git \
