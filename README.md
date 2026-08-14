@@ -36,6 +36,25 @@ if err != nil {
 }
 ```
 
+### Memory and worker recycling
+
+Prince's `--control` mode does not release all of the memory a job uses, so a
+process kept alive indefinitely grows without bound — on the order of 50-80KB
+retained per document, which adds up to gigabytes on a busy service. Each
+worker therefore replaces its prince process after a number of jobs, 1000 by
+default. Starting prince takes milliseconds, so this costs little next to
+rendering a document, and it keeps memory flat over the long run.
+
+Tune it with `WithMaxJobsPerWorker`, or pass zero to keep each process alive for
+the lifetime of the client:
+
+```go
+pc := princepdf.New(
+    princepdf.WithWorkerCount(4),
+    princepdf.WithMaxJobsPerWorker(500),
+)
+```
+
 ### Launch as Web Service
 
 Build and run from Go:
