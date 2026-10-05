@@ -277,3 +277,36 @@ func TestWorkerRelaunchFailures(t *testing.T) {
 		}
 	})
 }
+
+func TestStopWithBlockedRun(t *testing.T) {
+	useFakePrince(t)
+	failLaunches(t, -1)
+
+	pc := New(WithWorkerCount(1), WithMaxJobsPerWorker(1))
+	require.NoError(t, pc.Start())
+
+	// The first job succeeds, then the recycle after it fails forever, so
+	// nothing receives the second job and its Run blocks.
+	_, err := runWithin(t, pc, 5*time.Second)
+	require.NoError(t, err)
+
+	blocked := make(chan error, 1)
+	go func() {
+		_, err := pc.Run(simpleJob())
+		blocked <- err
+	}()
+	time.Sleep(20 * time.Millisecond) // let Run block on the send
+
+	require.NoError(t, pc.Stop())
+
+	select {
+	case err := <-blocked:
+		assert.ErrorIs(t, err, ErrStopped)
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked Run did not return after Stop")
+	}
+
+	// Run after Stop fails fast rather than blocking or panicking.
+	_, err = runWithin(t, pc, time.Second)
+	assert.ErrorIs(t, err, ErrStopped)
+}

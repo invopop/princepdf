@@ -3,6 +3,7 @@ package princepdf
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -36,6 +37,10 @@ const (
 	stopTimeout = 20 * time.Second
 )
 
+// ErrStopped is returned by Run when the client is stopped before a worker
+// picks the job up.
+var ErrStopped = errors.New("princepdf: client stopped")
+
 var (
 	// cmdPrince and cmdPrinceOpts locate the prince binary. They are variables
 	// so that tests can stand in a fake that speaks the control protocol
@@ -62,7 +67,7 @@ var (
 // controller.
 type Client struct {
 	in          chan *Job
-	quit        chan struct{} // closed by Stop to interrupt relaunch retries
+	quit        chan struct{} // closed by Stop; in is never closed, as Run may still be sending
 	workerCount int
 	maxJobs     int
 	workers     []*worker
@@ -121,8 +126,9 @@ func (c *Client) Start() error {
 
 // Stop ends the workers and closes the client.
 func (c *Client) Stop() error {
+	// Signal shutdown through quit rather than by closing in: a Run blocked
+	// sending on in would panic if it were closed under it.
 	close(c.quit)
-	close(c.in)
 	for _, w := range c.workers {
 		if w == nil {
 			continue // Start failed before reaching this one
@@ -147,7 +153,11 @@ func (c *Client) Stop() error {
 func (c *Client) Run(job *Job) ([]byte, error) {
 	job.reply = make(chan *output)
 	defer close(job.reply)
-	c.in <- job
+	select {
+	case c.in <- job:
+	case <-c.quit:
+		return nil, ErrStopped
+	}
 	out := <-job.reply
 	return out.data, out.err
 }
@@ -225,7 +235,13 @@ func (w *worker) greet() {
 func (w *worker) start() {
 	defer close(w.done)
 	w.greet()
-	for job := range w.in {
+	for {
+		var job *Job
+		select {
+		case <-w.quit:
+			return
+		case job = <-w.in:
+		}
 		w.run(job)
 		w.jobs++
 		// Recycle only after the reply has been sent, so that a failure to
