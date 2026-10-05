@@ -30,14 +30,6 @@ const (
 	// negligible next to rendering a document.
 	maxJobsDefault = 1000
 
-	// relaunchAttempts is how many times we try to bring a replacement prince
-	// process up during a recycle before giving up on the worker.
-	relaunchAttempts = 5
-
-	// relaunchDelay is the base backoff between relaunch attempts, multiplied
-	// by the attempt number.
-	relaunchDelay = 200 * time.Millisecond
-
 	// stopTimeout bounds how long Stop waits for a worker to finish the job it
 	// is on. Prince can hang on a pathological document, and shutting the
 	// client down must not block indefinitely on one.
@@ -50,12 +42,27 @@ var (
 	// without needing prince installed.
 	cmdPrince     = "prince"
 	cmdPrinceOpts = []string{"--control"}
+
+	// newPrinceCmd builds the command for a prince process. Tests replace it
+	// to simulate launch failures.
+	newPrinceCmd = func() *exec.Cmd {
+		return exec.Command(cmdPrince, cmdPrinceOpts...)
+	}
+
+	// relaunchDelay is the base backoff between attempts to bring a
+	// replacement prince process up during a recycle, multiplied by the
+	// attempt number and capped at relaunchMaxDelay. A worker keeps trying
+	// until it succeeds or the client is stopped: retiring it instead would
+	// leave Run blocked forever once every worker had gone.
+	relaunchDelay    = 200 * time.Millisecond
+	relaunchMaxDelay = 30 * time.Second
 )
 
 // Client provides a client interface to be able to stream commands to the prince
 // controller.
 type Client struct {
 	in          chan *Job
+	quit        chan struct{} // closed by Stop to interrupt relaunch retries
 	workerCount int
 	maxJobs     int
 	workers     []*worker
@@ -88,6 +95,7 @@ func WithMaxJobsPerWorker(i int) Option {
 func New(opts ...Option) *Client {
 	c := &Client{
 		in:          make(chan *Job),
+		quit:        make(chan struct{}),
 		workerCount: workerCountDefault,
 		maxJobs:     maxJobsDefault,
 	}
@@ -102,7 +110,7 @@ func New(opts ...Option) *Client {
 func (c *Client) Start() error {
 	var err error
 	for i := range c.workers {
-		c.workers[i], err = newWorker(c.in, c.maxJobs)
+		c.workers[i], err = newWorker(c.in, c.quit, c.maxJobs)
 		if err != nil {
 			return fmt.Errorf("starting: %w", err)
 		}
@@ -113,6 +121,7 @@ func (c *Client) Start() error {
 
 // Stop ends the workers and closes the client.
 func (c *Client) Stop() error {
+	close(c.quit)
 	close(c.in)
 	for _, w := range c.workers {
 		if w == nil {
@@ -146,8 +155,9 @@ func (c *Client) Run(job *Job) ([]byte, error) {
 // worker represents and individual execution of a prince command that can
 // respond to an process a single stream of requests.
 type worker struct {
-	cmd *exec.Cmd
-	in  chan *Job
+	cmd  *exec.Cmd
+	in   chan *Job
+	quit chan struct{}
 
 	stderr *bufio.Reader
 	stdout *bufio.Reader
@@ -162,9 +172,10 @@ type worker struct {
 	done chan struct{}
 }
 
-func newWorker(in chan *Job, maxJobs int) (*worker, error) {
+func newWorker(in chan *Job, quit chan struct{}, maxJobs int) (*worker, error) {
 	w := &worker{
 		in:      in,
+		quit:    quit,
 		maxJobs: maxJobs,
 		done:    make(chan struct{}),
 	}
@@ -177,7 +188,7 @@ func newWorker(in chan *Job, maxJobs int) (*worker, error) {
 // launch spawns a prince process for the worker and wires up its pipes,
 // replacing those of any previous process.
 func (w *worker) launch() error {
-	w.cmd = exec.Command(cmdPrince, cmdPrinceOpts...)
+	w.cmd = newPrinceCmd()
 	stderr, err := w.cmd.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("preparing stderr: %w", err)
@@ -205,7 +216,10 @@ func (w *worker) greet() {
 	// first grab the version information which is sent automatically by prince
 	out := w.read()
 	fmt.Printf("started version: '%s'\n", string(out.data))
-	go w.printStderr()
+	// The drainer gets this process's reader rather than reading w.stderr,
+	// which the next recycle replaces while the old drainer may still be
+	// running.
+	go printStderr(w.stderr)
 }
 
 func (w *worker) start() {
@@ -219,7 +233,7 @@ func (w *worker) start() {
 		// succeeded.
 		if w.maxJobs > 0 && w.jobs >= w.maxJobs {
 			if err := w.recycle(); err != nil {
-				// The pool has lost this worker; the remaining ones carry on.
+				// Only returned once the client is stopping.
 				fmt.Printf("recycling worker: %s\n", err.Error())
 				return
 			}
@@ -228,25 +242,33 @@ func (w *worker) start() {
 }
 
 // recycle replaces the worker's prince process with a fresh one, discarding
-// the memory the old process accumulated.
+// the memory the old process accumulated. It retries a failed launch until it
+// succeeds, and only returns an error if the client is stopped first.
 func (w *worker) recycle() error {
 	w.stop()
 
-	var err error
-	for attempt := 1; attempt <= relaunchAttempts; attempt++ {
-		if err = w.launch(); err == nil {
+	for attempt := 1; ; attempt++ {
+		err := w.launch()
+		if err == nil {
 			w.greet()
 			return nil
 		}
-		time.Sleep(time.Duration(attempt) * relaunchDelay)
+		delay := time.Duration(attempt) * relaunchDelay
+		if delay > relaunchMaxDelay {
+			delay = relaunchMaxDelay
+		}
+		fmt.Printf("relaunching prince (attempt %d, retrying in %s): %s\n", attempt, delay, err.Error())
+		select {
+		case <-w.quit:
+			return fmt.Errorf("relaunching prince: client stopped after %d failed attempts: %w", attempt, err)
+		case <-time.After(delay):
+		}
 	}
-
-	return fmt.Errorf("relaunching prince after %d attempts: %w", relaunchAttempts, err)
 }
 
-func (w *worker) printStderr() {
+func printStderr(r *bufio.Reader) {
 	for {
-		line, err := w.stderr.ReadString('\n')
+		line, err := r.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
 				fmt.Printf("reading stderr: %s\n", err.Error())

@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -73,6 +76,10 @@ func fakePrince() {
 			if _, err := in.ReadString('\n'); err != nil {
 				return
 			}
+			// Real prince writes diagnostics to stderr; doing the same keeps
+			// the stderr drainers busy across recycles, so -race exercises
+			// them.
+			fmt.Fprintln(os.Stderr, "fake-prince: rendering")
 			writeFakeChunk(out, chunkPDF, []byte(fakePDF))
 			writeFakeChunk(out, chunkLog, []byte("done"))
 		}
@@ -176,5 +183,97 @@ func TestWorkerRecycling(t *testing.T) {
 		// 30 jobs recycled every 2 gives 15 recycles on top of the 3 initial
 		// launches, however the jobs are distributed between workers.
 		assert.Equal(t, 18, countLaunches(t, tally))
+	})
+}
+
+// failLaunches makes the next n prince launches fail to start, as if the
+// binary were missing, and shortens the relaunch backoff so tests stay fast.
+// A negative n fails every launch after the first.
+func failLaunches(t *testing.T, n int64) {
+	t.Helper()
+
+	var remaining atomic.Int64
+	remaining.Store(n)
+	var first atomic.Bool
+
+	origCmd, origDelay, origMax := newPrinceCmd, relaunchDelay, relaunchMaxDelay
+	newPrinceCmd = func() *exec.Cmd {
+		if !first.Swap(true) {
+			return origCmd() // let Start bring the worker up
+		}
+		if n < 0 || remaining.Add(-1) >= 0 {
+			return exec.Command(filepath.Join(t.TempDir(), "missing-prince"))
+		}
+		return origCmd()
+	}
+	relaunchDelay, relaunchMaxDelay = time.Millisecond, 5*time.Millisecond
+	t.Cleanup(func() {
+		newPrinceCmd, relaunchDelay, relaunchMaxDelay = origCmd, origDelay, origMax
+	})
+}
+
+// runWithin runs a job, failing the test instead of hanging if no worker
+// picks it up in time.
+func runWithin(t *testing.T, pc *Client, d time.Duration) ([]byte, error) {
+	t.Helper()
+
+	type result struct {
+		out []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := pc.Run(simpleJob())
+		done <- result{out, err}
+	}()
+	select {
+	case r := <-done:
+		return r.out, r.err
+	case <-time.After(d):
+		t.Fatalf("job not served within %s", d)
+		return nil, nil
+	}
+}
+
+func TestWorkerRelaunchFailures(t *testing.T) {
+	t.Run("keeps the worker after more failed relaunches than it used to allow", func(t *testing.T) {
+		useFakePrince(t)
+		// The previous version retired a worker after 5 failed attempts,
+		// which with a single worker left every later Run blocked forever.
+		failLaunches(t, 8)
+
+		pc := New(WithWorkerCount(1), WithMaxJobsPerWorker(1))
+		require.NoError(t, pc.Start())
+
+		for i := range 3 {
+			out, err := runWithin(t, pc, 5*time.Second)
+			require.NoError(t, err, "job %d", i)
+			assert.Equal(t, fakePDF, string(out), "job %d", i)
+		}
+
+		require.NoError(t, pc.Stop())
+	})
+
+	t.Run("stops promptly while relaunches keep failing", func(t *testing.T) {
+		useFakePrince(t)
+		failLaunches(t, -1)
+
+		pc := New(WithWorkerCount(1), WithMaxJobsPerWorker(1))
+		require.NoError(t, pc.Start())
+
+		// The first job succeeds, then the recycle after it fails forever.
+		out, err := runWithin(t, pc, 5*time.Second)
+		require.NoError(t, err)
+		assert.Equal(t, fakePDF, string(out))
+		time.Sleep(20 * time.Millisecond) // let a few relaunches fail
+
+		stopped := make(chan error, 1)
+		go func() { stopped <- pc.Stop() }()
+		select {
+		case err := <-stopped:
+			require.NoError(t, err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("Stop did not return while relaunches were failing")
+		}
 	})
 }
