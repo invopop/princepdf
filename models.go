@@ -1,6 +1,10 @@
 package princepdf
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+	"sort"
+)
 
 // NewJob instantiates a new job to send to prince using the provided source
 // HTML data file.
@@ -16,26 +20,44 @@ type Job struct {
 	PDF      *PDF              `json:"pdf,omitempty" form:"pdf"`
 	Metadata *Metadata         `json:"metadata,omitempty" form:"metadata"`
 	Files    map[string][]byte `json:"files,omitempty"`
-
-	// reply is used to send the output back to the caller
-	reply chan *output
 }
 
+// request builds the message for prince. It copies everything it rewrites,
+// so the Job is left untouched and can be run again, or concurrently.
 func (j *Job) request() *jobRequest {
 	req := &jobRequest{
 		Input:            new(Input),
-		PDF:              j.PDF,
 		Metadata:         j.Metadata,
 		JobResourceCount: 0,
 		resources:        make([][]byte, len(j.Files)),
 	}
 	*req.Input = *j.Input // copy
+	req.Input.Styles = slices.Clone(j.Input.Styles)
+	req.Input.Scripts = slices.Clone(j.Input.Scripts)
+	if j.PDF != nil {
+		pdf := *j.PDF
+		pdf.Attach = make([]*Attachment, 0, len(j.PDF.Attach))
+		for _, a := range j.PDF.Attach {
+			if a != nil {
+				c := *a
+				pdf.Attach = append(pdf.Attach, &c)
+			}
+		}
+		req.PDF = &pdf
+	}
 
+	// Number the files in name order, so the same job always gives the
+	// same request.
+	names := make([]string, 0, len(j.Files))
+	for n := range j.Files {
+		names = append(names, n)
+	}
+	sort.Strings(names)
 	i := 0
 	idxMap := make(map[string]int)
-	for n, r := range j.Files {
+	for _, n := range names {
 		idxMap[n] = i
-		req.resources[i] = r
+		req.resources[i] = j.Files[n]
 		i++
 	}
 	req.JobResourceCount = i
