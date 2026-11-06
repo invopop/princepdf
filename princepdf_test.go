@@ -31,7 +31,7 @@ func TestStartup(t *testing.T) {
 	t.Run("test with URL", func(t *testing.T) {
 		j := new(Job)
 		j.Input = &Input{
-			Src: "https://www.princexml.com/samples/invoice/invoicesample.html",
+			Src: "https://www.princexml.com/samples/invoice-plain/index.html",
 		}
 		out, err := pc.Run(j)
 		require.NoError(t, err)
@@ -104,8 +104,8 @@ func TestDocumentError(t *testing.T) {
 	_, err := runCtxWithin(t, pc, context.Background(), jobWithSrc(fakeSrcReject), 5*time.Second)
 	var perr *Error
 	require.ErrorAs(t, err, &perr)
-	assert.Equal(t, "cannot load document", perr.Message)
-	assert.EqualError(t, err, "prince error: cannot load document")
+	assert.Equal(t, "fake:reject: cannot load document; failed to load all input documents", perr.Message)
+	assert.EqualError(t, err, "prince error: fake:reject: cannot load document; failed to load all input documents")
 	assert.NotErrorIs(t, err, ErrProcess)
 
 	// The process is fine and keeps serving.
@@ -226,6 +226,44 @@ func TestStopKillsHungWorker(t *testing.T) {
 	assert.ErrorIs(t, p.Signal(syscall.Signal(0)), os.ErrProcessDone)
 }
 
+func TestBadJob(t *testing.T) {
+	pc, tally := startFake(t)
+
+	// Prince couldn't read the job: not retried, but the process is replaced.
+	_, err := runCtxWithin(t, pc, context.Background(), jobWithSrc(fakeSrcBadJob), 5*time.Second)
+	var perr *Error
+	require.ErrorAs(t, err, &perr)
+	assert.Equal(t, "bad JSON in job chunk", perr.Message)
+
+	assertServes(t, pc)
+	assert.Equal(t, 2, countLaunches(t, tally))
+}
+
+func TestProtocolErrors(t *testing.T) {
+	for _, src := range []string{fakeSrcUnknown, fakeSrcNegative, fakeSrcNoLog} {
+		t.Run(src, func(t *testing.T) {
+			pc, tally := startFake(t)
+
+			// Each attempt breaks its process: retried once, then fails.
+			_, err := runCtxWithin(t, pc, context.Background(), jobWithSrc(src), 5*time.Second)
+			require.ErrorIs(t, err, ErrProcess)
+
+			assertServes(t, pc)
+			assert.Equal(t, 3, countLaunches(t, tally))
+		})
+	}
+}
+
+func TestConversionErrors(t *testing.T) {
+	log := []byte("msg|wrn|doc.html:3|ignoring unknown property\n" +
+		"msg|err|doc.html|can't open input file\n" +
+		"msg|err|doc.html|can't open input file\n" +
+		"msg|err||failed to load all input documents\n" +
+		"fin|failure\n")
+	assert.Equal(t, "doc.html: can't open input file; failed to load all input documents", conversionErrors(log))
+	assert.Equal(t, "conversion failed", conversionErrors([]byte("fin|failure\n")))
+}
+
 // The tests below run against the real prince, when it is installed.
 
 func requirePrince(t *testing.T) {
@@ -321,6 +359,11 @@ const (
 	fakeSrcDie    = "fake:die"
 	fakeSrcHang   = "fake:hang"
 	fakeSrcReject = "fake:reject"
+	// Job sources that make it break the protocol.
+	fakeSrcBadJob   = "fake:badjob"
+	fakeSrcUnknown  = "fake:unknown"
+	fakeSrcNegative = "fake:negative"
+	fakeSrcNoLog    = "fake:nolog"
 )
 
 // TestFakePrince is not a test. It is the entry point used when the test binary
@@ -390,7 +433,22 @@ func fakePrince() {
 			case fakeSrcHang:
 				select {} // never answer
 			case fakeSrcReject:
-				writeFakeChunk(out, chunkErr, []byte("cannot load document"))
+				// What prince sends when a conversion fails: a log alone.
+				writeFakeChunk(out, chunkLog, []byte("msg|err|"+fakeSrcReject+"|cannot load document\nmsg|err||failed to load all input documents\nfin|failure\n"))
+				continue
+			case fakeSrcBadJob:
+				writeFakeChunk(out, chunkErr, []byte("bad JSON in job chunk"))
+				continue
+			case fakeSrcUnknown:
+				writeFakeChunk(out, "zzz", []byte("abc"))
+				continue
+			case fakeSrcNegative:
+				_, _ = fmt.Fprintf(out, "%s -1\n", chunkPDF)
+				_ = out.Flush()
+				continue
+			case fakeSrcNoLog:
+				writeFakeChunk(out, chunkPDF, []byte(fakePDF))
+				writeFakeChunk(out, chunkErr, []byte("out of step"))
 				continue
 			}
 			// Real prince writes diagnostics to stderr; doing the same keeps
@@ -462,8 +520,10 @@ func TestWorkerRecycling(t *testing.T) {
 
 		require.NoError(t, pc.Stop())
 
-		// One launch to start, plus a recycle after each pair of jobs.
-		assert.Equal(t, 4, countLaunches(t, tally))
+		// One launch to start, plus a recycle after each pair of jobs. The
+		// recycle after the last job races with Stop, which prevents new
+		// launches, so it may not happen.
+		assert.Contains(t, []int{3, 4}, countLaunches(t, tally))
 	})
 
 	t.Run("keeps one process when recycling is disabled", func(t *testing.T) {
@@ -498,8 +558,11 @@ func TestWorkerRecycling(t *testing.T) {
 		require.NoError(t, pc.Stop())
 
 		// 30 jobs recycled every 2 gives 15 recycles on top of the 3 initial
-		// launches, however the jobs are distributed between workers.
-		assert.Equal(t, 18, countLaunches(t, tally))
+		// launches, however the jobs are distributed between workers. Each
+		// worker's last recycle races with Stop and may not happen.
+		n := countLaunches(t, tally)
+		assert.GreaterOrEqual(t, n, 15)
+		assert.LessOrEqual(t, n, 18)
 	})
 }
 
@@ -626,4 +689,28 @@ func TestStopWithBlockedRun(t *testing.T) {
 	// Run after Stop fails fast rather than blocking or panicking.
 	_, err = runWithin(t, pc, time.Second)
 	assert.ErrorIs(t, err, ErrStopped)
+}
+
+func TestRealPrinceDocumentError(t *testing.T) {
+	requirePrince(t)
+	pc := New(WithWorkerCount(1))
+	require.NoError(t, pc.Start())
+	defer func() { assert.NoError(t, pc.Stop()) }()
+
+	j := &Job{
+		Input: &Input{Src: "doc.xml", Type: "xml"},
+		Files: map[string][]byte{"doc.xml": []byte("<a><b></a")},
+	}
+	_, err := pc.Run(j)
+	var perr *Error
+	require.ErrorAs(t, err, &perr)
+	assert.Contains(t, perr.Message, "could not load input file")
+	assert.NotErrorIs(t, err, ErrProcess)
+
+	// The process is fine.
+	pid := pc.workers[0].proc.Load().Pid
+	out, err := pc.Run(princeJob())
+	require.NoError(t, err)
+	assert.Equal(t, "%PDF", string(out[:4]))
+	assert.Equal(t, pid, pc.workers[0].proc.Load().Pid)
 }

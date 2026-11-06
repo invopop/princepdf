@@ -63,7 +63,7 @@ process is killed and replaced, as it may be hung. `Run` waits as long as it
 takes.
 
 ```go
-ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 defer cancel()
 out, err := pc.RunContext(ctx, j)
 ```
@@ -71,7 +71,8 @@ out, err := pc.RunContext(ctx, j)
 Errors tell you whose fault a failure was:
 
 - `*princepdf.Error`: prince rejected the job, for example because the
-  document couldn't be loaded. Running it again will fail the same way.
+  document couldn't be loaded; the message lists prince's errors. Running it
+  again will fail the same way.
 - `princepdf.ErrProcess` (check with `errors.Is`): the prince process died, was
   killed or stopped following the control protocol. The process is replaced
   straight away, and the job is retried once per worker before this error is
