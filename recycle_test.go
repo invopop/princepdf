@@ -2,6 +2,7 @@ package princepdf
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -21,6 +22,11 @@ const (
 	fakeEnv      = "PRINCEPDF_FAKE"
 	fakeTallyEnv = "PRINCEPDF_FAKE_TALLY"
 	fakePDF      = "%PDF-fake"
+
+	// Job sources that make the fake prince misbehave.
+	fakeSrcDie    = "fake:die"
+	fakeSrcHang   = "fake:hang"
+	fakeSrcReject = "fake:reject"
 )
 
 // TestFakePrince is not a test. It is the entry point used when the test binary
@@ -70,11 +76,28 @@ func fakePrince() {
 			if err != nil {
 				return
 			}
-			if _, err := io.ReadFull(in, make([]byte, n)); err != nil {
+			body := make([]byte, n)
+			if _, err := io.ReadFull(in, body); err != nil {
 				return
 			}
 			if _, err := in.ReadString('\n'); err != nil {
 				return
+			}
+			// The job's source picks a failure to act out.
+			var req struct {
+				Input struct {
+					Src string `json:"src"`
+				} `json:"input"`
+			}
+			_ = json.Unmarshal(body, &req)
+			switch req.Input.Src {
+			case fakeSrcDie:
+				os.Exit(3) // crash without answering
+			case fakeSrcHang:
+				select {} // never answer
+			case fakeSrcReject:
+				writeFakeChunk(out, chunkErr, []byte("cannot load document"))
+				continue
 			}
 			// Real prince writes diagnostics to stderr; doing the same keeps
 			// the stderr drainers busy across recycles, so -race exercises

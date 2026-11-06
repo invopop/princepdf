@@ -16,9 +16,6 @@ type Job struct {
 	PDF      *PDF              `json:"pdf,omitempty" form:"pdf"`
 	Metadata *Metadata         `json:"metadata,omitempty" form:"metadata"`
 	Files    map[string][]byte `json:"files,omitempty"`
-
-	// reply is used to send the output back to the caller
-	reply chan *output
 }
 
 func (j *Job) request() *jobRequest {

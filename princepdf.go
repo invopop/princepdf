@@ -2,13 +2,16 @@ package princepdf
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,16 +33,28 @@ const (
 	// keeps that bounded; prince starts in milliseconds, so the cost is
 	// negligible next to rendering a document.
 	maxJobsDefault = 1000
-
-	// stopTimeout bounds how long Stop waits for a worker to finish the job it
-	// is on. Prince can hang on a pathological document, and shutting the
-	// client down must not block indefinitely on one.
-	stopTimeout = 20 * time.Second
 )
 
 // ErrStopped is returned by Run when the client is stopped before a worker
 // picks the job up.
 var ErrStopped = errors.New("princepdf: client stopped")
+
+// ErrProcess is wrapped by the errors Run returns when the prince process
+// handling the job died, hung or stopped following the control protocol,
+// rather than prince rejecting the job. The process is replaced, so running
+// the job again may well succeed.
+var ErrProcess = errors.New("princepdf: prince process failed")
+
+// Error is returned by Run when prince rejects a job, for example because the
+// document could not be loaded. The prince process is unaffected, and running
+// the same job again will fail the same way.
+type Error struct {
+	Message string
+}
+
+func (e *Error) Error() string {
+	return "prince error: " + e.Message
+}
 
 var (
 	// cmdPrince and cmdPrinceOpts locate the prince binary. They are variables
@@ -61,12 +76,18 @@ var (
 	// leave Run blocked forever once every worker had gone.
 	relaunchDelay    = 200 * time.Millisecond
 	relaunchMaxDelay = 30 * time.Second
+
+	// stopTimeout bounds how long Stop waits for a worker to finish the job it
+	// is on. Prince can hang on a pathological document, and shutting the
+	// client down must not block indefinitely on one. A variable so tests can
+	// shorten it.
+	stopTimeout = 20 * time.Second
 )
 
 // Client provides a client interface to be able to stream commands to the prince
 // controller.
 type Client struct {
-	in          chan *Job
+	in          chan *task
 	quit        chan struct{} // closed by Stop; in is never closed, as Run may still be sending
 	workerCount int
 	maxJobs     int
@@ -99,7 +120,7 @@ func WithMaxJobsPerWorker(i int) Option {
 // New instantiates a new PrincePDF client
 func New(opts ...Option) *Client {
 	c := &Client{
-		in:          make(chan *Job),
+		in:          make(chan *task),
 		quit:        make(chan struct{}),
 		workerCount: workerCountDefault,
 		maxJobs:     maxJobsDefault,
@@ -140,34 +161,94 @@ func (c *Client) Stop() error {
 		case <-w.done:
 			w.stop()
 		case <-time.After(stopTimeout):
-			// Still rendering, so its process is not ours to touch. Leave it
-			// to be cleaned up as the parent exits.
-			fmt.Printf("gave up waiting for worker to finish after %s\n", stopTimeout)
+			// Still rendering, probably hung. Killing the process makes the
+			// worker fail the job and leave its loop, after which it is safe
+			// to clean up.
+			fmt.Printf("worker still busy after %s, killing prince\n", stopTimeout)
+			w.killCurrent()
+			select {
+			case <-w.done:
+				w.stop()
+			case <-time.After(stopTimeout):
+				fmt.Printf("gave up waiting for worker to finish after killing prince\n")
+			}
 		}
 	}
 	return nil
 
 }
 
-// Run sends a job to the prince controller and returns the output.
+// Run sends a job to the prince controller and returns the output. It is
+// RunContext without a deadline.
 func (c *Client) Run(job *Job) ([]byte, error) {
-	job.reply = make(chan *output)
-	defer close(job.reply)
+	return c.RunContext(context.Background(), job)
+}
+
+// RunContext sends a job to the prince controller and returns the output.
+//
+// If ctx ends before the job finishes, RunContext returns ctx's error. When
+// prince was already rendering the job, its process is killed and replaced,
+// since it may be hung and is in any case busy with work nobody will read.
+//
+// Errors where prince rejected the job are of type *Error. Errors where the
+// prince process failed wrap ErrProcess. Such a job is retried, as the
+// process may have died before the job reached it, up to once per worker:
+// each worker replaces a failed process before taking another job, so by
+// then the job has met at least one fresh process.
+func (c *Client) RunContext(ctx context.Context, job *Job) ([]byte, error) {
+	if job == nil || job.Input == nil {
+		// Checked here, as a nil input would panic inside the worker.
+		return nil, errors.New("princepdf: job has no input")
+	}
+	for attempt := 1; ; attempt++ {
+		data, err := c.send(ctx, job)
+		if errors.Is(err, ErrProcess) && attempt <= c.workerCount && ctx.Err() == nil {
+			continue
+		}
+		return data, err
+	}
+}
+
+// send hands the job to a worker and waits for its reply or for ctx to end.
+func (c *Client) send(ctx context.Context, job *Job) ([]byte, error) {
+	// Buffered, so a worker can reply after the caller has given up.
+	t := &task{ctx: ctx, job: job, reply: make(chan *output, 1)}
 	select {
-	case c.in <- job:
+	case c.in <- t:
 	case <-c.quit:
 		return nil, ErrStopped
+	case <-ctx.Done():
+		return nil, fmt.Errorf("princepdf: %w", ctx.Err())
 	}
-	out := <-job.reply
-	return out.data, out.err
+	select {
+	case out := <-t.reply:
+		if out.err != nil && ctx.Err() != nil {
+			// The failure was most likely us killing the process.
+			return nil, fmt.Errorf("princepdf: %w", ctx.Err())
+		}
+		return out.data, out.err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("princepdf: %w", ctx.Err())
+	}
+}
+
+// task is a job handed to a worker, with what it needs to answer.
+type task struct {
+	ctx   context.Context
+	job   *Job
+	reply chan *output
 }
 
 // worker represents and individual execution of a prince command that can
 // respond to an process a single stream of requests.
 type worker struct {
 	cmd  *exec.Cmd
-	in   chan *Job
+	in   chan *task
 	quit chan struct{}
+
+	// proc is the current process, for Client.Stop to kill a worker stuck
+	// in a job without racing with the worker replacing cmd.
+	proc atomic.Pointer[os.Process]
 
 	stderr *bufio.Reader
 	stdout *bufio.Reader
@@ -182,7 +263,7 @@ type worker struct {
 	done chan struct{}
 }
 
-func newWorker(in chan *Job, quit chan struct{}, maxJobs int) (*worker, error) {
+func newWorker(in chan *task, quit chan struct{}, maxJobs int) (*worker, error) {
 	w := &worker{
 		in:      in,
 		quit:    quit,
@@ -215,6 +296,7 @@ func (w *worker) launch() error {
 	if err := w.cmd.Start(); err != nil {
 		return err
 	}
+	w.proc.Store(w.cmd.Process)
 	w.jobs = 0
 	w.ended = false
 	return nil
@@ -236,19 +318,24 @@ func (w *worker) start() {
 	defer close(w.done)
 	w.greet()
 	for {
-		var job *Job
+		var t *task
 		select {
 		case <-w.quit:
 			return
-		case job = <-w.in:
+		case t = <-w.in:
 		}
-		w.run(job)
+		out := w.run(t)
+		t.reply <- out
 		w.jobs++
 		// Recycle only after the reply has been sent, so that a failure to
 		// bring up the replacement can never affect a job that already
-		// succeeded.
-		if w.maxJobs > 0 && w.jobs >= w.maxJobs {
-			if err := w.recycle(); err != nil {
+		// succeeded. A broken process is replaced straight away: it would
+		// fail every later job.
+		if out.broken || (w.maxJobs > 0 && w.jobs >= w.maxJobs) {
+			if out.broken {
+				fmt.Printf("replacing failed prince process: %v\n", out.err)
+			}
+			if err := w.recycle(out.broken); err != nil {
 				// Only returned once the client is stopping.
 				fmt.Printf("recycling worker: %s\n", err.Error())
 				return
@@ -258,10 +345,15 @@ func (w *worker) start() {
 }
 
 // recycle replaces the worker's prince process with a fresh one, discarding
-// the memory the old process accumulated. It retries a failed launch until it
-// succeeds, and only returns an error if the client is stopped first.
-func (w *worker) recycle() error {
-	w.stop()
+// the memory the old process accumulated. A broken process is killed rather
+// than asked to end, as it may be hung. recycle retries a failed launch until
+// it succeeds, and only returns an error if the client is stopped first.
+func (w *worker) recycle(broken bool) error {
+	if broken {
+		w.kill()
+	} else {
+		w.stop()
+	}
 
 	for attempt := 1; ; attempt++ {
 		err := w.launch()
@@ -311,22 +403,74 @@ func (w *worker) stop() {
 	}
 }
 
-func (w *worker) run(job *Job) {
-	// send request to command
-	req := job.request()
-	data, err := json.Marshal(req)
-	if err != nil {
-		fmt.Printf("failed to marshal job: %s\n", err.Error())
+// kill shuts the current prince process down without asking, for a process
+// that is hung, dead or out of step with the control protocol.
+func (w *worker) kill() {
+	if w.ended {
 		return
 	}
+	w.ended = true
+	if err := w.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		fmt.Printf("killing prince: %s\n", err.Error())
+	}
+	_ = w.cmd.Wait() // reaps the process; it reports the kill as an error
+}
 
-	// Send to the stream
-	w.write(chunkJob, data)
-	for _, d := range req.resources {
-		w.write(chunkData, d)
+// killCurrent kills the current process from outside the worker's goroutine.
+// The worker notices when its next read or write fails.
+func (w *worker) killCurrent() {
+	if p := w.proc.Load(); p != nil {
+		if err := p.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			fmt.Printf("killing prince: %s\n", err.Error())
+		}
+	}
+}
+
+// run sends the task's job to prince and reads the result. If the task's
+// context ends first, the process is killed, which ends the exchange, and the
+// output is marked broken so the process gets replaced.
+func (w *worker) run(t *task) *output {
+	if err := t.ctx.Err(); err != nil {
+		// The caller gave up while the job was queued.
+		return &output{err: fmt.Errorf("princepdf: %w", err)}
+	}
+	req := t.job.request()
+	data, err := json.Marshal(req)
+	if err != nil {
+		return &output{err: fmt.Errorf("princepdf: encoding job: %w", err)}
 	}
 
-	job.reply <- w.read()
+	// Capture the process rather than reading w.cmd later: by the time the
+	// context ends, the worker may have moved on to a new process.
+	proc := w.cmd.Process
+	stopKill := context.AfterFunc(t.ctx, func() {
+		_ = proc.Kill()
+	})
+	out := w.exchange(data, req.resources)
+	if !stopKill() {
+		// The kill ran, or is running: the process is gone even if the
+		// job completed first.
+		out.broken = true
+	}
+	return out
+}
+
+// exchange writes a job and its resources to prince and reads the reply.
+func (w *worker) exchange(data []byte, resources [][]byte) *output {
+	if err := w.write(chunkJob, data); err != nil {
+		return processFailure("sending job", err)
+	}
+	for _, d := range resources {
+		if err := w.write(chunkData, d); err != nil {
+			return processFailure("sending resource", err)
+		}
+	}
+	return w.read()
+}
+
+// processFailure is the output for a job whose prince process failed.
+func processFailure(what string, err error) *output {
+	return &output{err: fmt.Errorf("%w: %s: %w", ErrProcess, what, err), broken: true}
 }
 
 func (w *worker) end() error {
@@ -343,7 +487,9 @@ func (w *worker) write(msg string, data []byte) error {
 	}
 
 	msg = fmt.Sprintf("%s %d", msg, len(data))
-	w.stdin.Write([]byte(msg + "\n"))
+	if _, err := w.stdin.Write([]byte(msg + "\n")); err != nil {
+		return fmt.Errorf("writing header: %w", err)
+	}
 
 	if _, err := w.stdin.Write(data); err != nil {
 		return fmt.Errorf("writing data: %w", err)
@@ -363,16 +509,14 @@ func (w *worker) read() *output {
 	var err error
 	line, err = w.stdout.ReadString('\n')
 	if err != nil {
-		o.err = fmt.Errorf("reading string: %w", err)
-		return o
+		return processFailure("reading string", err)
 	}
 	line = strings.TrimSpace(line)
 	fmt.Printf("line: '%s'\n", line)
 
 	parts := strings.Fields(line)
 	if len(parts) == 0 {
-		o.err = fmt.Errorf("invalid empty response")
-		return o
+		return processFailure("reading response", errors.New("invalid empty response"))
 	}
 
 	o.msg = parts[0]
@@ -381,30 +525,30 @@ func (w *worker) read() *output {
 	if len(parts) > 1 {
 		l, err := strconv.Atoi(parts[1])
 		if err != nil {
-			o.err = fmt.Errorf("invalid length: %w", err)
-			return o
+			return processFailure("invalid length", err)
 		}
 
 		o.data = make([]byte, l)
 		_, err = io.ReadFull(w.stdout, o.data)
 		if err != nil {
-			o.err = fmt.Errorf("reading data: %w", err)
-			return o
+			return processFailure("reading data", err)
 		}
 		_, err = w.stdout.ReadString('\n') // read the newline at the end
 		if err != nil {
-			o.err = fmt.Errorf("reading newline: %w", err)
-			return o
+			return processFailure("reading newline", err)
 		}
 	}
 
 	switch o.msg {
 	case chunkErr:
-		o.err = fmt.Errorf("prince error: %s", string(o.data))
+		o.err = &Error{Message: string(o.data)}
 		o.data = nil
 	case chunkPDF:
-		// pdf messages are always followed by a 'log' message
-		w.read()
+		// pdf messages are always followed by a 'log' message. If that
+		// fails, the PDF is still good but the process is not.
+		if l := w.read(); l.broken {
+			o.broken = true
+		}
 	case chunkLog:
 		fmt.Printf("log: %s\n", string(o.data))
 	}
@@ -417,4 +561,7 @@ type output struct {
 	msg  string // type of message from prince
 	data []byte
 	err  error
+	// broken is set when the prince process can't be trusted with another
+	// job: it died, was killed, or the stream got out of step.
+	broken bool
 }
